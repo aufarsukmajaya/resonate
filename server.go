@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,46 +23,128 @@ type server struct {
 	fleet     *Fleet
 	store     *Store
 	refreshMu sync.Mutex
+
+	// The last snapshot, shared by every open dashboard: a sweep is hundreds
+	// of calls, so N tabs must not cost N sweeps. There is no background
+	// sweep: nobody looking means no calls. snapSem (one slot) serialises
+	// sweeps and their recording; a settings save bumps configGen, which
+	// invalidates the cached one.
+	snapSem   chan struct{}
+	snap      *Snapshot
+	snapAt    time.Time // when its sweep finished; snapBegan, when it started
+	snapBegan time.Time
+	snapTTL   time.Duration
+	snapGen   int64
+	configGen atomic.Int64
+
+	// Deploy history is polled by every open tab while a deploy runs; one
+	// GitLab sync per runSyncEvery serves them all.
+	syncMu sync.Mutex
+	syncAt time.Time
 }
 
-func newHandler(f *Fleet) http.Handler {
-	srv := &server{fleet: f, store: f.store}
+// snapshotTimeout only stops a sweep that hangs; each GitLab, /version and
+// pod call has its own short timeout.
+const snapshotTimeout = 5 * time.Minute
+
+// recordTimeout bounds writing a snapshot's version changes.
+const recordTimeout = 30 * time.Second
+
+// statusTimeout is the longest /api/status takes: waiting out another
+// sweep, then running its own (after at most freshGap).
+const statusTimeout = 2 * (snapshotTimeout + recordTimeout)
+
+// runSyncEvery is a var so tests can sync on every request.
+var runSyncEvery = 2 * time.Second
+
+// freshGap is the least time between the end of one sweep and the start of a
+// forced one, so looping on ?fresh can't run sweeps back to back on the
+// bot's token. A var so tests can skip it.
+var freshGap = 5 * time.Second
+
+func newServer(f *Fleet) *server {
+	return &server{fleet: f, store: f.store, snapSem: make(chan struct{}, 1)}
+}
+
+func newHandler(f *Fleet) http.Handler { return newServer(f).routes() }
+
+func (s *server) routes() http.Handler {
 	web, _ := fs.Sub(webFS, "web")
 	mux := http.NewServeMux()
 	// The page itself holds no data; it shows the sign-in screen until /api/me answers.
 	mux.Handle("GET /", http.FileServerFS(web))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {})
-	mux.HandleFunc("GET /auth/gitlab", srv.gitlabStart)
-	mux.HandleFunc("GET /auth/callback", srv.gitlabCallback)
-	mux.HandleFunc("POST /auth/password", srv.passwordLogin)
-	mux.HandleFunc("POST /auth/logout", srv.logout)
+	mux.HandleFunc("GET /auth/gitlab", s.gitlabStart)
+	mux.HandleFunc("GET /auth/callback", s.gitlabCallback)
+	mux.HandleFunc("POST /auth/password", s.passwordLogin)
+	mux.HandleFunc("POST /auth/logout", s.logout)
 
-	mux.Handle("GET /api/me", srv.requireUser(false, srv.me))
-	mux.Handle("GET /api/status", srv.requireUser(false, srv.status))
-	mux.Handle("GET /api/deploys", srv.requireUser(false, srv.listDeploys))
-	mux.Handle("POST /api/deploys", srv.requireUser(false, srv.createDeploy))
-	mux.Handle("GET /api/sites/{site}/versions", srv.requireUser(false, srv.siteVersions))
-	mux.Handle("GET /api/settings", srv.requireUser(true, srv.getSettings))
-	mux.Handle("PUT /api/settings", srv.requireUser(true, srv.putSettings))
+	mux.Handle("GET /api/me", s.requireUser(false, s.me))
+	mux.Handle("GET /api/status", s.requireUser(false, s.status))
+	mux.Handle("GET /api/deploys", s.requireUser(false, s.listDeploys))
+	mux.Handle("POST /api/deploys", s.requireUser(false, s.createDeploy))
+	mux.Handle("GET /api/versions", s.requireUser(false, s.cellVersions))
+	mux.Handle("GET /api/settings", s.requireUser(true, s.getSettings))
+	mux.Handle("PUT /api/settings", s.requireUser(true, s.putSettings))
 	return mux
 }
 
-// observe takes a snapshot and records any site whose version changed.
-func (s *server) observe(ctx context.Context) (*Snapshot, error) {
-	snap, err := s.fleet.Snapshot(ctx)
+// observe returns a snapshot at most poll_seconds old (fresh forces a new
+// one) and records every cell whose version changed.
+func (s *server) observe(ctx context.Context, fresh bool) (*Snapshot, error) {
+	asked := time.Now()
+	// Wait out at most one sweep, so the reply fits in statusTimeout.
+	wait := time.NewTimer(snapshotTimeout + recordTimeout)
+	defer wait.Stop()
+	select {
+	case s.snapSem <- struct{}{}:
+	case <-wait.C:
+		return nil, errors.New("another fleet check is still running")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-s.snapSem }()
+	gen := s.configGen.Load()
+	if s.snap != nil && s.snapGen == gen {
+		// A sweep that began while this caller waited is as fresh as any.
+		if s.snapBegan.After(asked) || !fresh && time.Since(s.snapAt) < s.snapTTL {
+			return s.snap, nil
+		}
+	}
+	if d := freshGap - time.Since(s.snapAt); d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	// The result is shared, so one caller going away must not abort it.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotTimeout)
+	defer cancel()
+	began := time.Now()
+	snap, cfg, err := s.fleet.snapshot(sctx)
+	if err == nil && sctx.Err() != nil {
+		// Cells checked after the deadline failed for that reason alone;
+		// don't serve or record them as outages.
+		err = fmt.Errorf("checking the fleet took over %s", snapshotTimeout)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if n, err := s.store.RecordSnapshot(ctx, snap); err != nil {
+	// Recorded before anyone gets it, so the history matches the matrix.
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
+	defer rcancel()
+	if n, err := s.store.RecordSnapshot(rctx, snap); err != nil {
 		log.Printf("record snapshot: %v", err)
 	} else if n > 0 {
-		log.Printf("recorded %d site version change(s)", n)
+		log.Printf("recorded %d version change(s)", n)
 	}
+	s.snap, s.snapAt, s.snapBegan, s.snapTTL, s.snapGen = snap, time.Now(), began, time.Duration(cfg.PollSeconds)*time.Second, gen
 	return snap, nil
 }
 
 func (s *server) status(w http.ResponseWriter, r *http.Request) {
-	snap, err := s.observe(r.Context())
+	snap, err := s.observe(r.Context(), r.URL.Query().Has("fresh"))
 	if errors.Is(err, ErrNotConfigured) {
 		writeErr(w, http.StatusServiceUnavailable, err)
 		return
@@ -74,15 +157,25 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listDeploys(w http.ResponseWriter, r *http.Request) {
-	if err := s.fleet.SyncRuns(r.Context()); err != nil {
-		log.Printf("sync runs: %v", err)
-	}
+	s.syncRuns(r.Context())
 	list, err := s.store.ListDeploys(r.Context(), 30)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *server) syncRuns(ctx context.Context) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	if time.Since(s.syncAt) < runSyncEvery {
+		return
+	}
+	if err := s.fleet.SyncRuns(context.WithoutCancel(ctx)); err != nil {
+		log.Printf("sync runs: %v", err)
+	}
+	s.syncAt = time.Now()
 }
 
 // readJSON decodes a write request's body. Requiring a JSON content type
@@ -100,20 +193,20 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any) (int, error) {
 
 func (s *server) createDeploy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Sites []string `json:"sites"`
-		SHA   string   `json:"sha"`
+		Targets []Target `json:"targets"`
+		SHA     string   `json:"sha"`
 	}
 	if code, err := readJSON(w, r, &req); err != nil {
 		writeErr(w, code, err)
 		return
 	}
-	if len(req.Sites) == 0 || req.SHA == "" {
-		writeErr(w, http.StatusBadRequest, errors.New(`body must be {"sites": [...], "sha": "<head sha>"}`))
+	if len(req.Targets) == 0 || req.SHA == "" {
+		writeErr(w, http.StatusBadRequest, errors.New(`body must be {"targets": [{"site", "service", "postfix"}, ...], "sha": "<head sha>"}`))
 		return
 	}
 	u := userFrom(r.Context())
 	by := u.Username
-	d, err := s.fleet.Deploy(r.Context(), by, req.Sites, req.SHA, u.token)
+	d, err := s.fleet.Deploy(r.Context(), by, req.Targets, req.SHA, u.token)
 	if errors.Is(err, ErrStale) {
 		writeErr(w, http.StatusConflict, err)
 		return
@@ -122,7 +215,8 @@ func (s *server) createDeploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.store.AddDeploy(r.Context(), d); err != nil {
+	// The pipelines exist now; record them even if the client went away.
+	if err := s.store.AddDeploy(context.WithoutCancel(r.Context()), d); err != nil {
 		// The pipelines are already running; say so instead of pretending it failed.
 		log.Printf("deploy of %s triggered but not saved: %v", short(d.SHA), err)
 		writeJSON(w, http.StatusCreated, map[string]any{"deploy": d, "warning": "triggered, but not saved to history: " + err.Error()})
@@ -132,8 +226,10 @@ func (s *server) createDeploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"deploy": d})
 }
 
-func (s *server) siteVersions(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.store.ListSiteVersions(r.Context(), r.PathValue("site"), 100)
+// cellVersions is one (site, service) cell's history: ?site=&service=&postfix=
+func (s *server) cellVersions(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rows, err := s.store.ListSiteVersions(r.Context(), q.Get("site"), q.Get("service"), q.Get("postfix"), 100)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -192,6 +288,7 @@ func (s *server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.configGen.Add(1)
 	if req.AdminUser != "" || req.Password != "" {
 		user, hash, err := s.store.GetLogin(r.Context())
 		if err == nil && req.AdminUser != "" {
@@ -210,26 +307,6 @@ func (s *server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("settings saved by %s: %d site(s)", by, len(req.Sites))
 	s.getSettings(w, r)
-}
-
-// poll records site versions in the background so the tracker keeps its
-// history when nobody has the dashboard open.
-// The interval is re-read every round, so a change in Settings applies on the next tick.
-func (s *server) poll(ctx context.Context) {
-	for {
-		if _, err := s.observe(ctx); err != nil && !errors.Is(err, ErrNotConfigured) {
-			log.Printf("poll: %v", err)
-		}
-		every := time.Minute
-		if cfg, err := s.store.GetConfig(ctx); err == nil && cfg.PollSeconds > 0 {
-			every = time.Duration(cfg.PollSeconds) * time.Second
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(every):
-		}
-	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
