@@ -31,7 +31,8 @@ type server struct {
 	// invalidates the cached one.
 	snapSem   chan struct{}
 	snap      *Snapshot
-	snapAt    time.Time
+	snapAt    time.Time // when its sweep finished; snapBegan, when it started
+	snapBegan time.Time
 	snapTTL   time.Duration
 	snapGen   int64
 	configGen atomic.Int64
@@ -50,11 +51,16 @@ const snapshotTimeout = 5 * time.Minute
 const recordTimeout = 30 * time.Second
 
 // statusTimeout is the longest /api/status takes: waiting out another
-// sweep, then running its own.
+// sweep, then running its own (after at most freshGap).
 const statusTimeout = 2 * (snapshotTimeout + recordTimeout)
 
 // runSyncEvery is a var so tests can sync on every request.
 var runSyncEvery = 2 * time.Second
+
+// freshGap is the least time between the end of one sweep and the start of a
+// forced one, so looping on ?fresh can't run sweeps back to back on the
+// bot's token. A var so tests can skip it.
+var freshGap = 5 * time.Second
 
 func newServer(f *Fleet) *server {
 	return &server{fleet: f, store: f.store, snapSem: make(chan struct{}, 1)}
@@ -100,14 +106,22 @@ func (s *server) observe(ctx context.Context, fresh bool) (*Snapshot, error) {
 	defer func() { <-s.snapSem }()
 	gen := s.configGen.Load()
 	if s.snap != nil && s.snapGen == gen {
-		// A sweep that finished while this caller waited is as fresh as any.
-		if s.snapAt.After(asked) || !fresh && time.Since(s.snapAt) < s.snapTTL {
+		// A sweep that began while this caller waited is as fresh as any.
+		if s.snapBegan.After(asked) || !fresh && time.Since(s.snapAt) < s.snapTTL {
 			return s.snap, nil
+		}
+	}
+	if d := freshGap - time.Since(s.snapAt); d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	// The result is shared, so one caller going away must not abort it.
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotTimeout)
 	defer cancel()
+	began := time.Now()
 	snap, cfg, err := s.fleet.snapshot(sctx)
 	if err == nil && sctx.Err() != nil {
 		// Cells checked after the deadline failed for that reason alone;
@@ -125,7 +139,7 @@ func (s *server) observe(ctx context.Context, fresh bool) (*Snapshot, error) {
 	} else if n > 0 {
 		log.Printf("recorded %d version change(s)", n)
 	}
-	s.snap, s.snapAt, s.snapTTL, s.snapGen = snap, time.Now(), time.Duration(cfg.PollSeconds)*time.Second, gen
+	s.snap, s.snapAt, s.snapBegan, s.snapTTL, s.snapGen = snap, time.Now(), began, time.Duration(cfg.PollSeconds)*time.Second, gen
 	return snap, nil
 }
 

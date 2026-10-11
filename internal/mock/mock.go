@@ -289,7 +289,11 @@ func (s *Server) listEnvironments(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []map[string]string{}
+	search := strings.ToLower(r.URL.Query().Get("search")) // GitLab matches the start, ignoring case
 	for name := range s.stopped {
+		if !strings.HasPrefix(strings.ToLower(name), search) {
+			continue
+		}
 		out = append(out, map[string]string{"name": name, "state": "stopped"})
 	}
 	reply(w, 200, out)

@@ -496,7 +496,7 @@ label > .info { grid-area: 1 / 2; justify-self: start; }
           <label>URL <input type="url" name="url" placeholder="https://gitlab.example.com"><button type="button" class="info" data-tip="The address of your GitLab, the one you open in the browser.&#10;Example: https://gitlab.example.com"></button></label>
           <label>Project (path or id) <input type="text" name="project" placeholder="group/app"><button type="button" class="info" data-tip="Which repository holds the app: the part of its address after the GitLab URL (group/app), or the Project ID shown on the project page."></button></label>
           <label>Branch <input type="text" name="branch" placeholder="main"><button type="button" class="info" data-tip="The branch every site should be running, usually main. A cell is “behind” when it runs an older commit than this branch’s latest."></button></label>
-          <label>Re-check after (seconds) <input type="number" name="poll" min="10" required><button type="button" class="info" data-tip="How old a check may be before an open dashboard asks for a new one. Every open dashboard shares one check, and nothing is checked while nobody has it open. Lower means fresher but more GitLab requests. 60 is a good start; 10 is the minimum."></button></label>
+          <label>Re-check after (seconds) <input type="number" name="poll" min="10" max="86400" required><button type="button" class="info" data-tip="How old a check may be before an open dashboard asks for a new one. Every open dashboard shares one check, and nothing is checked while nobody has it open. Lower means fresher but more GitLab requests. 60 is a good start; 10 is the minimum."></button></label>
         </div>
       </fieldset>
       <fieldset>

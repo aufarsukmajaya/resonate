@@ -105,25 +105,32 @@ func (c *Config) pinsSHA() bool {
 	return slices.ContainsFunc(slices.Collect(maps.Values(c.PipelineInputs)), func(v string) bool { return strings.Contains(v, "{sha}") })
 }
 
-// environmentSearch is the literal start every environment name shares, so
-// listing stopped environments can skip the rest (review apps and such).
-func (c *Config) environmentSearch() string {
-	p := c.EnvironmentTemplate
-	if c.APIEnvironmentTemplate != "" {
-		p = commonPrefix(p, c.APIEnvironmentTemplate)
+// environmentSearches are the literal starts of the environments cells are
+// read from, so listing stopped environments can skip the rest (review apps
+// and such). GitLab matches a search against the start of a name, ignoring
+// case, so a search another one starts with is left out. A lone "" means no
+// usable search: list them all.
+func (c *Config) environmentSearches() []string {
+	var out []string
+	for _, t := range c.cells() {
+		if !t.fromGitLab() {
+			continue
+		}
+		// the environment's name up to where the service goes in
+		p, _, _ := strings.Cut(c.environment(t.site.Name, Service{Name: "{", Postfix: "{", Kind: t.svc.Kind}), "{")
+		if len(p) < 3 { // GitLab refuses shorter searches
+			return []string{""}
+		}
+		out = append(out, strings.ToLower(p))
 	}
-	if i := strings.IndexByte(p, '{'); i >= 0 {
-		p = p[:i]
+	slices.Sort(out) // a search sorts just before every one it covers
+	var kept []string
+	for _, p := range out {
+		if len(kept) == 0 || !strings.HasPrefix(p, kept[len(kept)-1]) {
+			kept = append(kept, p)
+		}
 	}
-	return p
-}
-
-func commonPrefix(a, b string) string {
-	n := 0
-	for n < len(a) && n < len(b) && a[n] == b[n] {
-		n++
-	}
-	return a[:n]
+	return kept
 }
 
 func (c *Config) environment(site string, svc Service) string {
@@ -186,8 +193,8 @@ func (c *Config) validate() error {
 	if c.GitLab.URL != "" && !isHTTP(c.GitLab.URL) {
 		return errors.New("gitlab url must be http(s)://...")
 	}
-	if c.PollSeconds < 10 {
-		return errors.New("poll_seconds must be at least 10")
+	if c.PollSeconds < 10 || c.PollSeconds > 86400 {
+		return errors.New("poll_seconds must be between 10 and 86400")
 	}
 	if c.EnvironmentTemplate == "" {
 		c.EnvironmentTemplate = "{site}-{service}{postfix}"
@@ -458,6 +465,9 @@ type target struct {
 	svc  Service
 }
 
+// fromGitLab: the cell is read from its GitLab environment, not an API's /version.
+func (t target) fromGitLab() bool { return t.svc.Kind != "api" || t.site.VersionURL == "" }
+
 // cells lists every (site, service) the fleet runs, row by row.
 func (c *Config) cells() []target {
 	var out []target
@@ -481,9 +491,9 @@ func (f *Fleet) snapshot(ctx context.Context) (*Snapshot, *Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("read %s head: %w", cfg.GitLab.Branch, err)
 	}
-	stopped, err := gl.stoppedEnvironments(ctx, cfg.environmentSearch())
+	stopped, err := gl.stoppedEnvironments(ctx, cfg.environmentSearches())
 	if err != nil {
-		log.Printf("stopped environments: %v", err) // judge cells by their deployments and pods alone
+		log.Printf("stopped environments: %v", err) // judge the cells it missed by their deployments and pods alone
 	}
 	refs := cfg.cells()
 	out := make([]Cell, len(refs))
@@ -534,7 +544,7 @@ func (f *Fleet) snapshot(ctx context.Context) (*Snapshot, *Config, error) {
 // couldn't tell) or none of its pods are ready.
 func check(ctx context.Context, gl gitlab, cfg *Config, head string, stopped map[string]bool, t target) Cell {
 	c := Cell{Site: t.site.Name, Service: t.svc.Name, Postfix: t.svc.Postfix, Kind: t.svc.Kind, Behind: -1}
-	if t.svc.Kind == "api" && t.site.VersionURL != "" {
+	if !t.fromGitLab() {
 		c.Source = "version"
 		v, err := fetchVersion(ctx, expand(t.site.VersionURL, t.site.Name, t.svc), cfg.VersionToken)
 		if err != nil {

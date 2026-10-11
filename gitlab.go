@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -127,28 +128,37 @@ func (g gitlab) running(ctx context.Context, env string) (ok, failed *deployment
 }
 
 // stoppedEnvironments names the project's stopped environments whose name
-// starts with prefix: their pods were torn down.
-func (g gitlab) stoppedEnvironments(ctx context.Context, prefix string) (map[string]bool, error) {
+// starts with one of searches ("" = any): their pods were torn down. A failed
+// search loses only its own names.
+func (g gitlab) stoppedEnvironments(ctx context.Context, searches []string) (map[string]bool, error) {
 	out := map[string]bool{}
-	q := url.Values{"states": {"stopped"}, "per_page": {"100"}}
-	if len(prefix) >= 3 { // GitLab ignores shorter searches
-		q.Set("search", prefix)
-	}
-	for page := 1; ; page++ {
-		var envs []struct {
-			Name string `json:"name"`
+	var mu sync.Mutex
+	var errs []error
+	eachLimited(len(searches), func(i int) {
+		q := url.Values{"states": {"stopped"}, "per_page": {"100"}}
+		if len(searches[i]) >= 3 { // GitLab refuses shorter searches: list them all
+			q.Set("search", searches[i])
 		}
-		q.Set("page", strconv.Itoa(page))
-		if err := g.do(ctx, http.MethodGet, "/environments?"+q.Encode(), nil, &envs); err != nil {
-			return nil, err
+		for page := 1; ; page++ {
+			var envs []struct {
+				Name string `json:"name"`
+			}
+			q.Set("page", strconv.Itoa(page))
+			err := g.do(ctx, http.MethodGet, "/environments?"+q.Encode(), nil, &envs)
+			mu.Lock()
+			if err != nil {
+				errs = append(errs, err)
+			}
+			for _, e := range envs {
+				out[e.Name] = true
+			}
+			mu.Unlock()
+			if err != nil || len(envs) < 100 {
+				return
+			}
 		}
-		for _, e := range envs {
-			out[e.Name] = true
-		}
-		if len(envs) < 100 {
-			return out, nil
-		}
-	}
+	})
+	return out, errors.Join(errs...)
 }
 
 // Pods counts a cell's pods, read through the GitLab agent for Kubernetes.

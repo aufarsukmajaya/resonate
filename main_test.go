@@ -156,6 +156,28 @@ func TestK8sProxy(t *testing.T) {
 	}
 }
 
+func TestEnvironmentSearches(t *testing.T) {
+	// medan's APIs answer /version, so only their workers are read from GitLab
+	c := &Config{Sites: []Site{{Name: "jakarta"}, {Name: "medan", VersionURL: "https://medan.example.com/{service}/version"}},
+		Services: []Service{{Name: "api-core", Kind: "api"}, {Name: "worker-sync", Kind: "worker"}}}
+	for _, tc := range []struct {
+		tmpl, api string
+		want      []string
+	}{
+		{"{site}-{service}{postfix}", "", []string{"jakarta-", "medan-"}},
+		{"{site}-{service}", "stable-{site}-{service}", []string{"jakarta-", "medan-", "stable-jakarta-"}},
+		{"App-{site}-{service}", "app-{service}", []string{"app-"}}, // covers app-jakarta- and app-medan-
+		{"app-{service}-{site}", "", []string{"app-"}},
+		{"{service}-{site}", "", []string{""}},
+		{"x-{service}-{site}", "", []string{""}}, // too short for GitLab
+	} {
+		c.EnvironmentTemplate, c.APIEnvironmentTemplate = tc.tmpl, tc.api
+		if got := c.environmentSearches(); !slices.Equal(got, tc.want) {
+			t.Errorf("environmentSearches(%q, %q) = %q, want %q", tc.tmpl, tc.api, got, tc.want)
+		}
+	}
+}
+
 // TestSchemaUpgrade applies schema.sql over the first release's schema: the
 // tables exist already, so every new column must come from an ALTER.
 func TestSchemaUpgrade(t *testing.T) {
@@ -225,7 +247,7 @@ func TestEndToEnd(t *testing.T) {
 	if dsn == "" {
 		t.Skip("RESONATE_TEST_DATABASE_URL not set")
 	}
-	runSyncEvery = 0
+	runSyncEvery, freshGap = 0, 0
 	ctx := context.Background()
 	store, err := openStore(ctx, dsn)
 	if err != nil {
